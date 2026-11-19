@@ -1,7 +1,3 @@
-Below is your README text **with all emojis removed**, making it cleaner and more professional for academic and open-source use.
-
-***
-
 # STM32 Drone Telemetry System - Source Code Package
 ## Complete Firmware and Data Pipeline Implementation
 
@@ -523,6 +519,3 @@ Electronics Engineering MINI Project
 **Last Updated:** October 27, 2025  
 **Version:** 1.0 (Core Functional Release)  
 **Status:** Production-Ready (UART/I2C) | SD Debug Phase
-
-***
-

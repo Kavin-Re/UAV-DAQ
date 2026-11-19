@@ -4,6 +4,19 @@
   * @file           : main.c
   * @brief          : Main program body (Drone Telemetry Decoder, OLED rate + time display)
   ******************************************************************************
+  *
+  * Application logic lives in telemetry.c. This file follows the STM32CubeMX
+  * layout so the project can be regenerated from "STM32 Telemetry.ioc".
+  *
+  * RECONSTRUCTION NOTICE
+  * The copy of main.c originally committed to this repository ended right after
+  * main(): SystemClock_Config(), the MX_*_Init() functions and Error_Handler()
+  * were declared but not defined, so it could not link. The definitions below
+  * were re-created from the settings stored in the .ioc file (HSI 16 MHz system
+  * clock, USART1 9600-8-N-1, SPI1 master mode 0 prescaler /2, I2C1, PB10 as SD
+  * chip select). The .ioc does not record the I2C bus speed; 100 kHz is taken
+  * from docs/legacy. TODO(verify on hardware): regenerate with CubeMX and diff.
+  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -11,56 +24,35 @@
 #include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include "ssd1306.h"
-#include "ssd1306_fonts.h"
+/* USER CODE BEGIN Includes */
+#include "telemetry.h"
+/* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
-// --- Telemetry Data Structure ---
-typedef struct {
-    float altitude;
-    float speed;
-    float voltage;
+/* USER CODE BEGIN PTD */
 
-    uint32_t timestamp_ms;   // From log (milliseconds from flight start)
-    uint32_t hours;          // From log
-    uint32_t minutes;
-    uint32_t seconds;
-
-    // Previous (for rate calculation)
-    float altitude_prev;
-    float speed_prev;
-    float voltage_prev;
-    uint32_t timestamp_prev;
-
-    // Calculated rates
-    float altitude_rate;
-    float speed_rate;
-    float voltage_rate;
-} TelemetryData_t;
+/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
-#define RX_BUFFER_SIZE 128
+/* USER CODE BEGIN PD */
 #define SD_CS_PORT GPIOB
 #define SD_CS_PIN  GPIO_PIN_10
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+
 SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-TelemetryData_t g_telemetry = {0};
-uint8_t rx_buffer[RX_BUFFER_SIZE];
-uint8_t rx_char;
-FATFS fs;
-FIL fil;
-FRESULT f_res;
-uint32_t bytes_written;
-uint8_t is_mounted = 0;
-extern Diskio_drvTypeDef  USER_Driver;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,146 +62,286 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
-void Telemetry_ReceiveAndParse(void);
-void Telemetry_Display(const TelemetryData_t *data);
-void Telemetry_Log(const TelemetryData_t *data);
-void Mount_SD_Card(void);
+
 /* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/** Attempt to mount SD card and write CSV header if file is new */
-void Mount_SD_Card(void)
-{
-    if (!is_mounted) {
-        f_res = f_mount(&fs, "", 1);
-        if (f_res == FR_OK) {
-            is_mounted = 1;
-            f_res = f_open(&fil, "telemetry.csv", FA_OPEN_ALWAYS | FA_WRITE);
-            if (f_res == FR_OK) {
-                if (f_size(&fil) == 0) {
-                    f_puts("TimeMS,Hour,Min,Sec,Altitude,Speed,Voltage\n", &fil);
-                }
-                f_close(&fil);
-            }
-        }
-    }
-}
-
-void Telemetry_Log(const TelemetryData_t *data)
-{
-    if (!is_mounted) {
-        Mount_SD_Card();
-        return;
-    }
-    char logBuffer[100];
-    sprintf(logBuffer, "%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f\n",
-        data->timestamp_ms, data->hours, data->minutes, data->seconds,
-        data->altitude, data->speed, data->voltage);
-    f_res = f_open(&fil, "telemetry.csv", FA_OPEN_APPEND | FA_WRITE);
-    if (f_res == FR_OK)
-    {
-        f_write(&fil, logBuffer, strlen(logBuffer), (void*)&bytes_written);
-        f_sync(&fil);
-        f_close(&fil);
-    }
-}
-
-void Telemetry_Display(const TelemetryData_t *data)
-{
-    char lineBuffer[32];
-
-    ssd1306_Fill(Black);
-
-    // Line 1: Time
-    ssd1306_SetCursor(0, 0);
-    sprintf(lineBuffer, "T:%02lu:%02lu:%02lu", data->hours, data->minutes, data->seconds);
-    ssd1306_WriteString(lineBuffer, Font_7x10, White);
-
-    // Line 2: Alt + its rate
-    ssd1306_SetCursor(0, 12);
-    sprintf(lineBuffer, "ALT:%.2f(%+.2f)", data->altitude, data->altitude_rate);
-    ssd1306_WriteString(lineBuffer, Font_7x10, White);
-
-    // Line 3: Speed + its rate
-    ssd1306_SetCursor(0, 24);
-    sprintf(lineBuffer, "SPD:%.2f(%+.2f)", data->speed, data->speed_rate);
-    ssd1306_WriteString(lineBuffer, Font_7x10, White);
-
-    // Line 4: Volt + its rate
-    ssd1306_SetCursor(0, 36);
-    sprintf(lineBuffer, "V:%.2f(%+.3f)", data->voltage, data->voltage_rate);
-    ssd1306_WriteString(lineBuffer, Font_7x10, White);
-
-    ssd1306_SetCursor(0, 48);
-    ssd1306_WriteString(is_mounted ? "LOGGING: OK" : "LOGGING: FAIL", Font_6x8, White);
-
-    ssd1306_UpdateScreen();
-}
-
-/** Receives one line of telemetry, parses CSV, calculates rates, updates times from log */
-void Telemetry_ReceiveAndParse(void)
-{
-    static uint32_t buffer_index = 0;
-
-    if (HAL_UART_Receive(&huart1, &rx_char, 1, 100) == HAL_OK)
-    {
-        if (rx_char == '\n' || buffer_index >= RX_BUFFER_SIZE - 1)
-        {
-            rx_buffer[buffer_index] = '\0';
-            buffer_index = 0;
-
-            // --- CSV FORMAT: TimeMS,Hour,Min,Sec,Altitude,Speed,Voltage ---
-            uint32_t time_ms, h, m, s;
-            float alt, spd, volt;
-
-            int parsed = sscanf((char*)rx_buffer, "%lu,%lu,%lu,%lu,%f,%f,%f",
-                &time_ms, &h, &m, &s, &alt, &spd, &volt);
-            if (parsed == 7)
-            {
-                // Compute deltas for rate-of-change
-                float delta_time = (time_ms - g_telemetry.timestamp_ms) / 1000.0f;
-                if(delta_time < 0.001f) delta_time = 0.001f; // avoid zero
-
-                g_telemetry.altitude_rate = (alt - g_telemetry.altitude) / delta_time;
-                g_telemetry.speed_rate    = (spd - g_telemetry.speed) / delta_time;
-                g_telemetry.voltage_rate  = (volt - g_telemetry.voltage) / delta_time;
-
-                g_telemetry.timestamp_ms = time_ms;
-                g_telemetry.hours = h;
-                g_telemetry.minutes = m;
-                g_telemetry.seconds = s;
-                g_telemetry.altitude = alt;
-                g_telemetry.speed = spd;
-                g_telemetry.voltage = volt;
-
-                Telemetry_Display(&g_telemetry);
-                Telemetry_Log(&g_telemetry);
-            }
-        } else {
-            rx_buffer[buffer_index++] = rx_char;
-        }
-    }
-}
 /* USER CODE END 0 */
 
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   MX_SPI1_Init();
   MX_FATFS_Init();
-
+  /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_SET);
-  ssd1306_Init();
-  Mount_SD_Card();
-  Telemetry_Display(&g_telemetry);
+  Telemetry_Init();   /* OLED init, SD mount attempt, first screen */
+  /* USER CODE END 2 */
 
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
+      /* Blocks for at most 100 ms waiting for one UART byte. There must be no
+         delay here: USART1 has a one-byte receive register and at 9600 baud a
+         new byte arrives every ~1.04 ms. The original loop called HAL_Delay(10)
+         after every byte, which overruns the receiver on any line longer than
+         one character. NEEDS HARDWARE RE-TEST. */
       Telemetry_ReceiveAndParse();
-      HAL_Delay(10);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration (HSI 16 MHz, PLL off - as stored in the .ioc)
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
   }
 }
+
+/**
+  * @brief I2C1 Initialization Function (SSD1306 OLED)
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function (SD card, SPI mode 0)
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function (telemetry input, 9600-8-N-1)
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB10 (SD card chip select) */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
