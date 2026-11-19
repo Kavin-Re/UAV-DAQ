@@ -3,6 +3,19 @@
   ******************************************************************************
   * @file    user_diskio.c
   * @brief   SD-SPI Disk I/O driver for FATFS
+  *
+  * Build note: STM32CubeMX generates an empty FATFS/Target/user_diskio.c for the
+  * "User-defined" FatFs mode. Replace that file with this one (see
+  * firmware/README.md).
+  *
+  * Audit fixes (docs/FIRMWARE_AUDIT.md) - verified against the simulated card in
+  * firmware/tests only, NEEDS HARDWARE RE-TEST:
+  *  - single-sector read/write always returned RES_ERROR (=> f_mount FR_DISK_ERR)
+  *  - multi-sector write sent the 0xFC token but never the data
+  *  - multi-sector read released CS after the first block
+  *  - the card was polled for "ready" while de-selected, so busy was never seen
+  *  - timeouts were ~10x longer than documented (5 s / 10 s per command)
+  *  - HAL_SPI_Receive() clocked out the previous buffer contents on MOSI
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -41,6 +54,11 @@
 #define DATA_START_BLOCK        0xFE
 #define WRITE_START_BLOCK       0xFE
 #define WRITE_MULTIPLE_BLOCK    0xFC
+#define STOP_TRAN_TOKEN         0xFD
+
+// Timeouts (HAL tick = 1 ms)
+#define SD_READY_TIMEOUT_MS     500U   // card busy after a write / before a command
+#define SD_TOKEN_TIMEOUT_MS     200U   // wait for the data start token on a read
 
 /* Private variables ---------------------------------------------------------*/
 extern SPI_HandleTypeDef hspi1; // Your SPI handle
@@ -52,6 +70,8 @@ static BYTE CardType;  // Type of SD card (SDv1/SDv2/MMC)
 static void spi_xmit_byte(BYTE data);
 static BYTE spi_rcvr_byte(void);
 static BYTE spi_wait_ready(void);
+static void sd_deselect(void);
+static int sd_select(void);
 static BYTE sd_send_cmd(BYTE cmd, DWORD arg);
 static DRESULT sd_rcvr_datablock(BYTE *buff, UINT btr);
 static DRESULT sd_xmit_datablock(const BYTE *buff, BYTE token);
@@ -81,34 +101,60 @@ static BYTE spi_rcvr_byte(void)
 
 /**
   * @brief Waits for the card to transition from busy to ready.
+  * @note  Only meaningful while the card is selected (CS low): a de-selected
+  *        card releases MISO and the pull-up reads back 0xFF immediately.
   */
 static BYTE spi_wait_ready(void)
 {
     BYTE d;
-    UINT tmr = 5000; // 500ms timeout at 1ms resolution
+    uint32_t start = HAL_GetTick();
 
     do {
         d = spi_rcvr_byte();
         if (d == 0xFF) return d;
-        HAL_Delay(1);
-    } while (--tmr);
+    } while ((HAL_GetTick() - start) < SD_READY_TIMEOUT_MS);
     return d;
+}
+
+/**
+  * @brief Releases the card and clocks one idle byte so it lets go of MISO.
+  */
+static void sd_deselect(void)
+{
+    SD_CS_HIGH();
+    spi_rcvr_byte();
+}
+
+/**
+  * @brief Selects the card and waits until it is not busy.
+  * @retval 1 = ready, 0 = timeout (card is de-selected again).
+  */
+static int sd_select(void)
+{
+    SD_CS_LOW();
+    spi_rcvr_byte();
+    if (spi_wait_ready() == 0xFF) return 1;
+    sd_deselect();
+    return 0;
 }
 
 /**
   * @brief Sends a command to the SD card.
   * @param cmd: Command byte.
   * @param arg: 32-bit command argument.
-  * @retval R1 response.
+  * @retval R1 response (0xFF = no response / card not ready).
+  * @note  The card is left selected so that the caller can read the rest of the
+  *        response or the data phase; callers finish with sd_deselect().
   */
 static BYTE sd_send_cmd(BYTE cmd, DWORD arg)
 {
     BYTE n, res;
 
-    // Check for card readiness
-    if (cmd != CMD12 && spi_wait_ready() != 0xFF) return 0xFF;
-
-    SD_CS_LOW(); // Select the card
+    // Start a new transaction and wait for the card (except to stop a read)
+    if (cmd != CMD12) {
+        sd_deselect();
+        if (!sd_select()) return 0xFF;
+    }
 
     // Send command packet
     spi_xmit_byte(cmd);
@@ -123,13 +169,13 @@ static BYTE sd_send_cmd(BYTE cmd, DWORD arg)
     if (cmd == CMD8) n = 0x87;
     spi_xmit_byte(n);
 
+    if (cmd == CMD12) spi_rcvr_byte(); // Discard the stuff byte after STOP_TRANSMISSION
+
     // Receive command response (R1 is single byte, wait up to 10 trials)
     for (n = 10; n; n--) {
         res = spi_rcvr_byte();
         if (!(res & 0x80)) break;
     }
-
-    if (res == 0xFF) SD_CS_HIGH(); // Deselect on failure
 
     return res;
 }
@@ -139,35 +185,34 @@ static BYTE sd_send_cmd(BYTE cmd, DWORD arg)
   * @param buff: Pointer to the buffer to store data.
   * @param btr: Number of bytes to receive (should be 512).
   * @retval DRESULT: Operation result.
+  * @note  CS is left asserted: a multi-block read continues with the next block.
   */
 static DRESULT sd_rcvr_datablock(BYTE *buff, UINT btr)
 {
     BYTE token;
-    UINT tmr = 10000; // 1000ms timeout
+    uint32_t start = HAL_GetTick();
 
     do {                            // Wait for data start token
         token = spi_rcvr_byte();
-        HAL_Delay(1);
-    } while ((token == 0xFF) && --tmr);
+    } while ((token == 0xFF) && ((HAL_GetTick() - start) < SD_TOKEN_TIMEOUT_MS));
 
     if(token != DATA_START_BLOCK) return RES_ERROR;
 
-    // Receive data packet (512 bytes)
-    HAL_SPI_Receive(&hspi1, buff, btr, HAL_MAX_DELAY);
+    // Receive data packet (512 bytes). In 2-line master mode HAL_SPI_Receive()
+    // transmits the buffer contents, and the card must see MOSI high.
+    memset(buff, 0xFF, btr);
+    if (HAL_SPI_Receive(&hspi1, buff, btr, HAL_MAX_DELAY) != HAL_OK) return RES_ERROR;
 
     spi_rcvr_byte();                // Discard CRC
     spi_rcvr_byte();
-
-    SD_CS_HIGH();
-    spi_rcvr_byte();                // Idle clocks
 
     return RES_OK;
 }
 
 /**
   * @brief Sends a data block to the SD card.
-  * @param buff: Pointer to the buffer containing data.
-  * @param token: Data token (WRITE_START_BLOCK or WRITE_MULTIPLE_BLOCK).
+  * @param buff: Pointer to the buffer containing data (unused for the stop token).
+  * @param token: WRITE_START_BLOCK, WRITE_MULTIPLE_BLOCK or STOP_TRAN_TOKEN.
   * @retval DRESULT: Operation result.
   */
 static DRESULT sd_xmit_datablock(const BYTE *buff, BYTE token)
@@ -178,9 +223,9 @@ static DRESULT sd_xmit_datablock(const BYTE *buff, BYTE token)
 
     spi_xmit_byte(token); // Send token
 
-    if (token != WRITE_MULTIPLE_BLOCK) {
+    if (token != STOP_TRAN_TOKEN) {
         // Send data packet (512 bytes)
-        HAL_SPI_Transmit(&hspi1, (uint8_t*)buff, 512, HAL_MAX_DELAY);
+        if (HAL_SPI_Transmit(&hspi1, (uint8_t*)buff, 512, HAL_MAX_DELAY) != HAL_OK) return RES_ERROR;
 
         spi_xmit_byte(0xFF); // Dummy CRC
         spi_xmit_byte(0xFF);
@@ -245,15 +290,18 @@ DSTATUS USER_initialize (
             }
         } else {
             // SDv1 or MMC (simplified check)
+            // TODO(verify on hardware): a real SDv1 card needs ACMD41 repeated
+            // until it leaves idle, MMC needs CMD1, and both need CMD16 (512).
+            // Only SDv2/SDHC cards are expected to work.
             if (sd_send_cmd(CMD55, 0) <= 1 && sd_send_cmd(CMD41, 0) == 0) ty = 1; // SDv1
             else ty = 3; // MMCv3
         }
     }
 
-    SD_CS_HIGH(); // Deselect
-    spi_rcvr_byte(); // Idle clocks
+    sd_deselect();
 
     CardType = ty;
+    Stat = STA_NOINIT; // A failed re-initialisation must not leave the old state
     if (ty) {
         Stat &= ~STA_NOINIT; // Clear NOINIT flag on success
 
@@ -261,6 +309,9 @@ DSTATUS USER_initialize (
         // 5. HIGH SPEED SWITCH: Switch to fast SPI clock (Prescaler /2)
         // ************************************************************
         // Restore the high-speed setting from MX_SPI1_Init for data transfer.
+        // PCLK2/2 = 8 MHz with the 16 MHz HSI clock of the .ioc. If the system
+        // clock is ever raised to 84 MHz this becomes 42 MHz - above the 25 MHz
+        // default-speed limit of SD cards - and the prescaler must be increased.
         hspi1.Instance->CR1 &= (~SPI_CR1_BR_Msk); // Clear Baud Rate bits
         hspi1.Instance->CR1 |= SPI_BAUDRATEPRESCALER_2; // Set Prescaler to /2
     }
@@ -300,26 +351,27 @@ DRESULT USER_read (
 {
   /* USER CODE BEGIN READ */
     if (pdrv || (Stat & STA_NOINIT)) return RES_NOTRDY;
+    if (!count) return RES_PARERR;
     if (!(CardType & 4)) sector *= 512; // Convert LBA to byte address for SDv1/MMC
 
     // Read multiple sectors
     if (count > 1) {
-        if (sd_send_cmd(CMD18, sector) != 0) return RES_ERROR;
-        do {
-            if (sd_rcvr_datablock(buff, 512) != RES_OK) break;
-            buff += 512;
-        } while (--count);
-        sd_send_cmd(CMD12, 0); // Stop transmission
+        if (sd_send_cmd(CMD18, sector) == 0) {
+            do {
+                if (sd_rcvr_datablock(buff, 512) != RES_OK) break;
+                buff += 512;
+            } while (--count);
+            sd_send_cmd(CMD12, 0); // Stop transmission
+        }
     }
     // Read single sector
     else {
-        if (sd_send_cmd(CMD17, sector) == 0) {
-            sd_rcvr_datablock(buff, 512);
+        if (sd_send_cmd(CMD17, sector) == 0 && sd_rcvr_datablock(buff, 512) == RES_OK) {
+            count = 0;
         }
     }
 
-    SD_CS_HIGH(); // Ensure deselect
-    spi_rcvr_byte();
+    sd_deselect();
 
     return count ? RES_ERROR : RES_OK;
   /* USER CODE END READ */
@@ -343,26 +395,28 @@ DRESULT USER_write (
 {
   /* USER CODE BEGIN WRITE */
     if (pdrv || (Stat & STA_NOINIT)) return RES_NOTRDY;
+    if (!count) return RES_PARERR;
     if (!(CardType & 4)) sector *= 512; // Convert LBA to byte address
 
     // Write multiple sectors
     if (count > 1) {
-        if (sd_send_cmd(CMD25, sector) != 0) return RES_ERROR;
-        do {
-            if (sd_xmit_datablock(buff, WRITE_MULTIPLE_BLOCK) != RES_OK) return RES_ERROR;
-            buff += 512;
-        } while (--count);
-        spi_xmit_byte(0xFD); // Stop token
+        if (sd_send_cmd(CMD25, sector) == 0) {
+            do {
+                if (sd_xmit_datablock(buff, WRITE_MULTIPLE_BLOCK) != RES_OK) break;
+                buff += 512;
+            } while (--count);
+            if (sd_xmit_datablock(0, STOP_TRAN_TOKEN) != RES_OK) count = 1; // Stop token
+        }
     }
     // Write single sector
     else {
-        if (sd_send_cmd(CMD24, sector) == 0) {
-            sd_xmit_datablock(buff, WRITE_START_BLOCK);
+        if (sd_send_cmd(CMD24, sector) == 0 && sd_xmit_datablock(buff, WRITE_START_BLOCK) == RES_OK) {
+            count = 0;
         }
     }
 
-    SD_CS_HIGH(); // Ensure deselect
-    spi_rcvr_byte();
+    // The card is still programming here; the next sd_select() waits for it.
+    sd_deselect();
 
     return count ? RES_ERROR : RES_OK;
   /* USER CODE END WRITE */
@@ -385,13 +439,13 @@ DRESULT USER_ioctl (
 {
   /* USER CODE BEGIN IOCTL */
     // Simplified IOCTL implementation
-    if (Stat & STA_NOINIT) return RES_NOTRDY;
+    if (pdrv || (Stat & STA_NOINIT)) return RES_NOTRDY;
 
     DRESULT res = RES_ERROR;
 
     switch (cmd) {
         case CTRL_SYNC: // Make sure that data has been written to the card
-            if (spi_wait_ready() == 0xFF) res = RES_OK;
+            if (sd_select()) res = RES_OK; // select + wait until not busy
             break;
         case GET_SECTOR_SIZE: // Returns 512
             *(WORD*)buff = 512;
@@ -405,8 +459,7 @@ DRESULT USER_ioctl (
             res = RES_PARERR;
     }
 
-    SD_CS_HIGH();
-    spi_rcvr_byte();
+    sd_deselect();
 
     return res;
   /* USER CODE END IOCTL */

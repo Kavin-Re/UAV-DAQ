@@ -1,104 +1,41 @@
-<<<<<<< HEAD
 # Build outputs
 *.o
+*.d
 *.a
-*.so
 *.elf
 *.bin
 *.hex
 *.map
+*.su
+firmware/build/
+firmware/tests/build/
 
-# STM32CubeIDE
+# STM32CubeIDE / CubeMX working files
 Debug/
 Release/
-*.make
-*.elf
+.settings/
+*.launch
+.mxproject
+
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
+.venv/
 venv/
+env/
 *.egg-info/
+.mypy_cache/
+.ruff_cache/
 
-# IDE
+# Ground-station outputs
+replay.csv
+*.log.csv
+
+# IDE / OS
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Build artifacts
-*.o
-*.obj
-*.lib
-*.a
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-=======
-# Prerequisites
-*.d
-
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
->>>>>>> b93725920853d119dbb3e5cabea05267271a8d99

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ground-station:
+    name: Ground station (lint + tests, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: ground_station
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install lint tools
+        run: python -m pip install "ruff==0.16.9" mypy
+      - name: Ruff (lint)
+        run: ruff check .
+      - name: Ruff (format check)
+        run: ruff format --check .
+      - name: Mypy
+        run: mypy --ignore-missing-imports uavdaq_gs
+      - name: Unit tests (standard library only)
+        run: python -m unittest discover -s tests -v
+      - name: Replay demo (no hardware)
+        run: >
+          python -m uavdaq_gs monitor --replay ../data/telemetry.csv --every 50 --quiet
+          --checksum --require-checksum --corrupt 0.05 --log replay.csv
+
+  firmware-host-tests:
+    name: Firmware logic on host (gcc + ASan/UBSan, simulated SD card)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run host tests
+        run: make -C firmware/tests
+
+  firmware-static-analysis:
+    # The firmware itself is NOT cross-compiled in CI: the STM32 HAL, CMSIS,
+    # FatFs and the linker script are not part of this repository (they are
+    # regenerated from the .ioc with STM32CubeMX - see firmware/README.md), so
+    # an arm-none-eabi-gcc job could not link. Static analysis of the project's
+    # own sources runs instead.
+    name: Firmware static analysis (cppcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: cppcheck - errors fail the build
+        run: >
+          cppcheck --std=c11 --error-exitcode=1 --inline-suppr
+          --suppress=missingInclude --suppress=missingIncludeSystem
+          -D_USE_WRITE=1 -D_USE_IOCTL=1
+          firmware/Core/Src/main.c firmware/Core/Src/telemetry.c
+          firmware/drivers/user_diskio.c
+      - name: cppcheck - full report (informational)
+        if: always()
+        run: >
+          cppcheck --std=c11 --enable=warning,style,performance,portability --inline-suppr
+          --suppress=missingInclude --suppress=missingIncludeSystem
+          -D_USE_WRITE=1 -D_USE_IOCTL=1
+          firmware/Core/Src/main.c firmware/Core/Src/telemetry.c
+          firmware/drivers/user_diskio.c firmware/tests/sd_card_sim.c firmware/tests/hal_stub.c || true

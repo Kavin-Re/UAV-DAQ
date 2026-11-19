@@ -1,76 +1,117 @@
 ##############################################################################
-# STM32 Drone Telemetry System - Makefile
-# Target: STM32F401RE
-# Toolchain: arm-none-eabi-gcc
+# UAV-DAQ firmware - command-line build for STM32F401RE (arm-none-eabi-gcc)
+#
+# STATUS: UNTESTED. The supported build is STM32CubeIDE (see README.md in this
+# directory). This Makefile only works after STM32CubeMX has regenerated the
+# vendor code from "STM32 Telemetry.ioc", because the repository does not
+# contain:
+#     Drivers/                      STM32F4 HAL + CMSIS
+#     Middlewares/Third_Party/FatFs FatFs R0.12c
+#     FATFS/App, FATFS/Target       fatfs.c/.h, ffconf.h, user_diskio.h
+#     STM32F401RETX_FLASH.ld        linker script
+#
+#   make            build build/uav-daq.elf / .hex / .bin
+#   make flash      program with st-flash
+#   make host-test  run the PC unit tests (needs only a host gcc)
 ##############################################################################
 
-# MCU and Toolchain Variables
-MCU = cortex-m4
-DEVICE = STM32F401RE
-CC = arm-none-eabi-gcc
-LD = arm-none-eabi-ld
-OBJCOPY = arm-none-eabi-objcopy
-OBJDUMP = arm-none-eabi-objdump
-SIZE = arm-none-eabi-size
+TARGET    = uav-daq
+BUILD_DIR = build
 
-# Directory Structure
-SRC_DIR = Core/Src
-INC_DIR = Core/Inc
-DRIVERS_DIR = Drivers
-FATFS_DIR = Middlewares/FatFs/src
-# Add more directories as needed
+PREFIX  ?= arm-none-eabi-
+CC       = $(PREFIX)gcc
+OBJCOPY  = $(PREFIX)objcopy
+SIZE     = $(PREFIX)size
 
-# Firmware source files
-SRC = \
-  $(SRC_DIR)/main.c \
-  $(SRC_DIR)/stm32f4xx_it.c \
-  $(SRC_DIR)/syscalls.c \
-  $(SRC_DIR)/system_stm32f4xx.c \
-  $(SRC_DIR)/ssd1306.c \
-  $(SRC_DIR)/ssd1306_tests.c \
-  $(SRC_DIR)/ssd1306_fonts.c \
-  $(DRIVERS_DIR)/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c \
-  $(DRIVERS_DIR)/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_gpio.c \
-  $(DRIVERS_DIR)/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_uart.c \
-  $(FATFS_DIR)/ff.c \
-  $(FATFS_DIR)/diskio.c \
-  $(FATFS_DIR)/user_diskio.c
+HAL_DIR   = Drivers/STM32F4xx_HAL_Driver
+CMSIS_DIR = Drivers/CMSIS
+FATFS_MW  = Middlewares/Third_Party/FatFs/src
+LDSCRIPT  = STM32F401RETX_FLASH.ld
 
-# Include paths
-INCLUDES = -I$(INC_DIR) -I$(DRIVERS_DIR)/STM32F4xx_HAL_Driver/Inc -IMiddlewares/FatFs/inc
+VENDOR_REQUIRED = $(HAL_DIR)/Src $(CMSIS_DIR)/Include $(FATFS_MW)/ff.c FATFS/App/fatfs.c $(LDSCRIPT)
 
-# Build options
-CFLAGS = -mcpu=$(MCU) -mthumb -Wall -g -O2 $(INCLUDES) \
-  -DUSE_HAL_DRIVER -DSTM32F401xE
+# Application sources that ARE in this repository
+C_SOURCES = \
+  Core/Src/main.c \
+  Core/Src/telemetry.c \
+  Core/Src/stm32f4xx_it.c \
+  Core/Src/stm32f4xx_hal_msp.c \
+  Core/Src/system_stm32f4xx.c \
+  Core/Src/syscalls.c \
+  Core/Src/sysmem.c \
+  Core/Src/ssd1306.c \
+  Core/Src/ssd1306_fonts.c \
+  drivers/user_diskio.c
 
-LDFLAGS = -TSTM32F401RETX_FLASH.ld
+# Vendor sources produced by STM32CubeMX (drivers/user_diskio.c replaces the
+# empty FATFS/Target/user_diskio.c template, which is therefore not listed)
+C_SOURCES += \
+  $(filter-out %_template.c,$(wildcard $(HAL_DIR)/Src/*.c)) \
+  $(FATFS_MW)/ff.c \
+  $(FATFS_MW)/diskio.c \
+  $(FATFS_MW)/ff_gen_drv.c \
+  $(wildcard $(FATFS_MW)/option/syscall.c) \
+  FATFS/App/fatfs.c
 
-# Target binary names
-TARGET = stm32_telemetry.elf
-HEX = stm32_telemetry.hex
+ASM_SOURCES = Core/Startup/startup_stm32f401retx.s
 
-# Default build rule
-all: $(HEX)
+INCLUDES = \
+  -ICore/Inc \
+  -Idrivers \
+  -IFATFS/App \
+  -IFATFS/Target \
+  -I$(FATFS_MW) \
+  -I$(HAL_DIR)/Inc \
+  -I$(HAL_DIR)/Inc/Legacy \
+  -I$(CMSIS_DIR)/Device/ST/STM32F4xx/Include \
+  -I$(CMSIS_DIR)/Include
 
-# Compile to ELF binary
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
+MCU     = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+DEFS    = -DUSE_HAL_DRIVER -DSTM32F401xE
+CFLAGS  = $(MCU) $(DEFS) $(INCLUDES) -std=gnu11 -Og -g3 -Wall -ffunction-sections -fdata-sections
+# -u _printf_float: snprintf("%.2f") needs float support in newlib-nano
+LDFLAGS = $(MCU) -T$(LDSCRIPT) --specs=nano.specs --specs=nosys.specs -u _printf_float \
+          -Wl,--gc-sections -Wl,-Map=$(BUILD_DIR)/$(TARGET).map -lc -lm
+
+OBJECTS = $(addprefix $(BUILD_DIR)/,$(C_SOURCES:.c=.o) $(ASM_SOURCES:.s=.o))
+
+all: check-vendor $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).hex $(BUILD_DIR)/$(TARGET).bin
+
+check-vendor:
+	@missing=""; for f in $(VENDOR_REQUIRED); do [ -e "$$f" ] || missing="$$missing $$f"; done; \
+	if [ -n "$$missing" ]; then \
+	  echo "error: vendor files are not in this repository:$$missing"; \
+	  echo "       Regenerate them from 'STM32 Telemetry.ioc' with STM32CubeMX first -"; \
+	  echo "       see firmware/README.md. ('make host-test' works without them.)"; \
+	  exit 1; \
+	fi
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+	@mkdir -p $(dir $@)
+	$(CC) -c $(MCU) -x assembler-with-cpp $< -o $@
+
+$(BUILD_DIR)/$(TARGET).elf: $(OBJECTS)
+	$(CC) $(OBJECTS) $(LDFLAGS) -o $@
 	$(SIZE) $@
 
-# Convert ELF to HEX for flashing
-$(HEX): $(TARGET)
+$(BUILD_DIR)/%.hex: $(BUILD_DIR)/%.elf
 	$(OBJCOPY) -O ihex $< $@
 
-# Clean build artifacts
+$(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf
+	$(OBJCOPY) -O binary $< $@
+
+flash: all
+	st-flash write $(BUILD_DIR)/$(TARGET).bin 0x8000000
+
+host-test:
+	$(MAKE) -C tests
+
 clean:
-	rm -f $(TARGET) $(HEX) *.o *.d
+	rm -rf $(BUILD_DIR)
+	$(MAKE) -C tests clean
 
-# Print size
-size:
-	$(SIZE) $(TARGET)
-
-# Download to board (assumes st-flash installed)
-flash: $(HEX)
-	st-flash write $(HEX) 0x8000000
-
-.PHONY: all clean size flash
+.PHONY: all check-vendor flash host-test clean

@@ -1,7 +1,3 @@
-Here’s your project report **with all emojis removed** and tables aligned using Markdown for professional formatting:
-
-***
-
 # Drone Telemetry Decoder and Real-Time Display System
 ## Complete Project Report with Hardware, Firmware, and Debugging Documentation
 
@@ -276,6 +272,3 @@ STM32 Telemetry/
 **Report Generated:** October 27, 2025  
 **Status:** Functional Core | Final Debug Phase  
 **Prepared by:** Kavin.K.K, Electronics Engineering Student, Rashtriya Raksha University
-
-***
-

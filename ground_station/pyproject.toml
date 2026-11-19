@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uavdaq-gs"
+version = "0.2.0"
+description = "Ground-station tools for the UAV-DAQ STM32 telemetry decoder"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5"]
+plot = ["matplotlib>=3.7"]
+
+[project.scripts]
+uavdaq-gs = "uavdaq_gs.cli:main"
+
+[tool.setuptools]
+packages = ["uavdaq_gs"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
