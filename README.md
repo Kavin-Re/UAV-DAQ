@@ -2,8 +2,8 @@
 
 > **Status: frozen, 2026-11-23.** First STM32 project (October 2025), kept as the record of where the work
 > started. **Not done:** SD-card logging never worked, and the firmware cannot be built from this repository
-> as it stands (see Known defects). A rewrite of this README in the author's own words is planned; this
-> version only removes claims the code does not support.
+> as it stands (see Known defects). This README describes only what the code in this repository
+> supports.
 
 An STM32F401RE (NUCLEO-F401RE) receives telemetry as text lines over USART1 at 9600 baud, parses them, shows
 altitude, speed, battery voltage and their rates of change on a 0.96" SSD1306 OLED (I2C), and tries to append
